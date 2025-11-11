@@ -1,0 +1,31 @@
+{
+  "name": "insurance-erp",
+  "version": "2.0.0",
+  "description": "Complete Insurance Management System with Modern UI",
+  "main": "index.js",
+  "scripts": {
+    "dev": "npx tailwindcss -i ./assets/css/main.css -o ./assets/css/output.css --watch",
+    "build": "npx tailwindcss -i ./assets/css/main.css -o ./assets/css/output.css --minify"
+  },
+  "keywords": [
+    "insurance",
+    "erp",
+    "tailwind",
+    "alpine"
+  ],
+  "author": "NA-FIX ERP Solutions",
+  "license": "Proprietary",
+  "devDependencies": {
+    "tailwindcss": "^3.4.1"
+  },
+  "dependencies": {
+    "@tailwindcss/forms": "^0.5.7",
+    "@tailwindcss/typography": "^0.5.10",
+    "alpinejs": "^3.13.5",
+    "aos": "^2.3.4",
+    "chart.js": "^4.4.1",
+    "gsap": "^3.12.5",
+    "sweetalert2": "^11.10.5",
+    "toastify-js": "^1.12.0"
+  }
+}
