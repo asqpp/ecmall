@@ -1,19 +1,128 @@
 <?php
 /**
  * =====================================================
- * Insurance Management System v2.0 - Database Setup
+ * NA-FIX ERP System - Complete Database Setup
  * =====================================================
  *
  * This script will:
- * 1. Create database: cybor432_erpnew
- * 2. Import database schema (23 tables)
- * 3. Import sample data
+ * 1. Check system requirements
+ * 2. Create database: cybor432_erpnew
+ * 3. Import complete database (100+ tables) from fullscheme.sql
+ * 4. Import additional data from additional_data.sql (optional)
+ * 5. Configure database connection
+ * 6. Create installation logs
+ * 7. Redirect to dashboard
  *
  * IMPORTANT: Run this file only once during installation!
  * After successful setup, DELETE or RENAME this file for security.
  *
  * =====================================================
  */
+
+// Enable error reporting for installation
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// Create logs directory if not exists
+if (!is_dir(__DIR__ . '/logs')) {
+    mkdir(__DIR__ . '/logs', 0755, true);
+}
+
+// Initialize log file
+$log_file = __DIR__ . '/logs/setup_' . date('Y-m-d_H-i-s') . '.log';
+
+/**
+ * Log function with timestamp
+ */
+function log_message($message, $type = 'INFO') {
+    global $log_file;
+    $timestamp = date('Y-m-d H:i:s');
+    $log_entry = "[$timestamp] [$type] $message" . PHP_EOL;
+    file_put_contents($log_file, $log_entry, FILE_APPEND);
+    return $log_entry;
+}
+
+/**
+ * System requirements checker
+ */
+function check_system_requirements() {
+    $checks = [];
+
+    // PHP Version
+    $php_version = phpversion();
+    $checks['php_version'] = [
+        'name' => 'PHP Version (7.2 or higher)',
+        'status' => version_compare($php_version, '7.2.0', '>='),
+        'current' => $php_version,
+        'required' => '7.2.0+'
+    ];
+
+    // MySQLi Extension
+    $checks['mysqli'] = [
+        'name' => 'MySQLi Extension',
+        'status' => extension_loaded('mysqli'),
+        'current' => extension_loaded('mysqli') ? 'Enabled' : 'Disabled',
+        'required' => 'Required'
+    ];
+
+    // mbstring Extension
+    $checks['mbstring'] = [
+        'name' => 'Mbstring Extension',
+        'status' => extension_loaded('mbstring'),
+        'current' => extension_loaded('mbstring') ? 'Enabled' : 'Disabled',
+        'required' => 'Required'
+    ];
+
+    // JSON Extension
+    $checks['json'] = [
+        'name' => 'JSON Extension',
+        'status' => extension_loaded('json'),
+        'current' => extension_loaded('json') ? 'Enabled' : 'Disabled',
+        'required' => 'Required'
+    ];
+
+    // Writable config directory
+    $config_dir = __DIR__ . '/application/config';
+    $checks['config_writable'] = [
+        'name' => 'Config Directory Writable',
+        'status' => is_writable($config_dir),
+        'current' => is_writable($config_dir) ? 'Writable' : 'Not Writable',
+        'required' => 'Required'
+    ];
+
+    // Writable logs directory
+    $logs_dir = __DIR__ . '/application/logs';
+    $checks['logs_writable'] = [
+        'name' => 'Logs Directory Writable',
+        'status' => is_writable($logs_dir),
+        'current' => is_writable($logs_dir) ? 'Writable' : 'Not Writable',
+        'required' => 'Required'
+    ];
+
+    // Check if fullscheme.sql exists
+    $checks['fullscheme'] = [
+        'name' => 'Main Database File (fullscheme.sql)',
+        'status' => file_exists(__DIR__ . '/fullscheme.sql'),
+        'current' => file_exists(__DIR__ . '/fullscheme.sql') ? 'Found' : 'Not Found',
+        'required' => 'Required'
+    ];
+
+    // Check if additional_data.sql exists
+    $checks['additional_data'] = [
+        'name' => 'Additional Data File (additional_data.sql)',
+        'status' => file_exists(__DIR__ . '/additional_data.sql'),
+        'current' => file_exists(__DIR__ . '/additional_data.sql') ? 'Found' : 'Not Found (Optional)',
+        'required' => 'Optional'
+    ];
+
+    log_message('System requirements check completed');
+    foreach ($checks as $key => $check) {
+        $status = $check['status'] ? 'PASS' : 'FAIL';
+        log_message("{$check['name']}: {$status} - {$check['current']}", $status);
+    }
+
+    return $checks;
+}
 
 // Prevent running setup multiple times
 if (file_exists('SETUP_COMPLETE.lock')) {
@@ -87,67 +196,87 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Select the database
         $conn->select_db($db_name);
 
-        // Step 3: Import schema
-        $schema_file = __DIR__ . '/database/schema.sql';
+        // Step 3: Import main database (fullscheme.sql)
+        log_message('Starting import of main database (fullscheme.sql)');
+        $schema_file = __DIR__ . '/fullscheme.sql';
+
         if (!file_exists($schema_file)) {
-            throw new Exception("Schema file not found: $schema_file");
+            throw new Exception("Main database file not found: fullscheme.sql");
         }
 
         $schema_sql = file_get_contents($schema_file);
+        log_message('Read fullscheme.sql (' . strlen($schema_sql) . ' bytes)');
 
-        // Execute schema (split by ;)
-        $statements = array_filter(array_map('trim', explode(';', $schema_sql)));
-        $table_count = 0;
+        // Remove comments and split into statements
+        $schema_sql = preg_replace('/^--.*$/m', '', $schema_sql); // Remove SQL comments
+        $schema_sql = preg_replace('/\/\*.*?\*\//s', '', $schema_sql); // Remove multi-line comments
 
-        foreach ($statements as $statement) {
-            if (empty($statement) || strpos($statement, '--') === 0) continue;
-
-            if ($conn->multi_query($statement)) {
-                do {
-                    if ($result = $conn->store_result()) {
-                        $result->free();
-                    }
-                } while ($conn->next_result());
-
-                if (stripos($statement, 'CREATE TABLE') !== false) {
-                    $table_count++;
+        // Execute the entire SQL file using multi_query
+        if ($conn->multi_query($schema_sql)) {
+            $table_count = 0;
+            do {
+                if ($result = $conn->store_result()) {
+                    $result->free();
                 }
+
+                // Count CREATE TABLE statements
+                if ($conn->error) {
+                    log_message('Query error: ' . $conn->error, 'WARNING');
+                }
+            } while ($conn->more_results() && $conn->next_result());
+
+            // Count tables created
+            $result = $conn->query("SELECT COUNT(*) as table_count FROM information_schema.tables WHERE table_schema = '$db_name'");
+            if ($result) {
+                $row = $result->fetch_assoc();
+                $table_count = $row['table_count'];
+                $result->free();
             }
+
+            log_message("Database schema imported successfully ($table_count tables created)");
+            $success_messages[] = "✓ Complete database imported ($table_count tables created)";
+        } else {
+            throw new Exception("Error importing database: " . $conn->error);
         }
 
-        $success_messages[] = "✓ Database schema imported ($table_count tables created)";
+        // Step 4: Import additional data (optional but recommended)
+        if (isset($_POST['import_additional_data']) && $_POST['import_additional_data'] === 'yes') {
+            $additional_file = __DIR__ . '/additional_data.sql';
 
-        // Step 4: Import sample data (optional)
-        if (isset($_POST['import_sample_data']) && $_POST['import_sample_data'] === 'yes') {
-            $sample_file = __DIR__ . '/database/sample_data.sql';
+            if (file_exists($additional_file)) {
+                log_message('Starting import of additional_data.sql');
+                $additional_sql = file_get_contents($additional_file);
+                log_message('Read additional_data.sql (' . strlen($additional_sql) . ' bytes)');
 
-            if (file_exists($sample_file)) {
-                $sample_sql = file_get_contents($sample_file);
-                $statements = array_filter(array_map('trim', explode(';', $sample_sql)));
-                $insert_count = 0;
+                // Remove comments
+                $additional_sql = preg_replace('/^--.*$/m', '', $additional_sql);
+                $additional_sql = preg_replace('/\/\*.*?\*\//s', '', $additional_sql);
 
-                foreach ($statements as $statement) {
-                    if (empty($statement) || strpos($statement, '--') === 0) continue;
-
-                    if ($conn->multi_query($statement)) {
-                        do {
-                            if ($result = $conn->store_result()) {
-                                $result->free();
-                            }
-                        } while ($conn->next_result());
-
-                        if (stripos($statement, 'INSERT INTO') !== false) {
-                            $insert_count++;
+                if ($conn->multi_query($additional_sql)) {
+                    do {
+                        if ($result = $conn->store_result()) {
+                            $result->free();
                         }
-                    }
-                }
+                        if ($conn->error) {
+                            log_message('Additional data query error: ' . $conn->error, 'WARNING');
+                        }
+                    } while ($conn->more_results() && $conn->next_result());
 
-                $success_messages[] = "✓ Sample data imported ($insert_count insert statements executed)";
+                    log_message('Additional data imported successfully');
+                    $success_messages[] = "✓ Additional data imported (extra users, accounts, permissions)";
+                } else {
+                    log_message('Error importing additional data: ' . $conn->error, 'WARNING');
+                    $success_messages[] = "⚠️ Additional data import had some warnings (check logs)";
+                }
+            } else {
+                log_message('additional_data.sql not found, skipping', 'INFO');
             }
         }
 
         // Step 5: Update database config file
+        log_message('Updating database configuration file');
         $config_file = __DIR__ . '/application/config/database.php';
+
         if (file_exists($config_file)) {
             $config_content = file_get_contents($config_file);
 
@@ -173,20 +302,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $config_content
             );
 
-            file_put_contents($config_file, $config_content);
-            $success_messages[] = "✓ Database configuration updated";
+            if (file_put_contents($config_file, $config_content)) {
+                log_message('Database configuration file updated successfully');
+                $success_messages[] = "✓ Database configuration updated";
+            } else {
+                throw new Exception("Failed to update database configuration file");
+            }
+        } else {
+            throw new Exception("Database configuration file not found: $config_file");
         }
 
         // Create lock file
-        file_put_contents('SETUP_COMPLETE.lock', date('Y-m-d H:i:s'));
+        $lock_content = "Installation completed on: " . date('Y-m-d H:i:s') . "\n";
+        $lock_content .= "Database: $db_name\n";
+        $lock_content .= "Host: $db_host\n";
+        $lock_content .= "Log file: $log_file\n";
+        file_put_contents('SETUP_COMPLETE.lock', $lock_content);
+        log_message('Setup completed successfully - Lock file created');
+
         $setup_complete = true;
 
         $conn->close();
+        log_message('Database connection closed');
 
     } catch (Exception $e) {
         $errors[] = $e->getMessage();
+        log_message('ERROR: ' . $e->getMessage(), 'ERROR');
     }
 }
+
+// Always check system requirements
+$system_checks = check_system_requirements();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -353,7 +499,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <!-- Success Screen -->
             <div class="success-icon">🎉</div>
             <h1 style="text-align: center; color: #28a745;">Setup Complete!</h1>
-            <p class="subtitle" style="text-align: center;">Your Insurance Management System is ready to use</p>
+            <p class="subtitle" style="text-align: center;">Your NA-FIX ERP System is ready to use</p>
 
             <?php foreach ($success_messages as $msg): ?>
                 <div class="alert alert-success"><?php echo $msg; ?></div>
@@ -363,22 +509,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <h3>✅ What was installed:</h3>
                 <ul>
                     <li>✓ Database: <strong><?php echo $db_name; ?></strong></li>
-                    <li>✓ 23 Database Tables</li>
-                    <li>✓ Complete Schema</li>
-                    <?php if (isset($_POST['import_sample_data']) && $_POST['import_sample_data'] === 'yes'): ?>
-                    <li>✓ Sample Data (Demo accounts, products, transactions)</li>
+                    <li>✓ 100+ Database Tables (Complete ERP System)</li>
+                    <li>✓ Double-Entry Accounting System</li>
+                    <li>✓ Insurance Management Modules</li>
+                    <li>✓ Sales, Purchase, Inventory Modules</li>
+                    <li>✓ User Authentication & Role Management</li>
+                    <?php if (isset($_POST['import_additional_data']) && $_POST['import_additional_data'] === 'yes'): ?>
+                    <li>✓ Additional Data (Extra users: manager, accountant, underwriter, claims)</li>
+                    <li>✓ Extended Chart of Accounts</li>
+                    <li>✓ Comprehensive Role Permissions</li>
                     <?php endif; ?>
                 </ul>
+            </div>
+
+            <div class="info-box">
+                <h3>🔑 Default Login Credentials:</h3>
+                <ul style="background: #fff; padding: 15px; border-radius: 5px; margin-top: 10px;">
+                    <li><strong>Username:</strong> admin</li>
+                    <li><strong>Password:</strong> admin123</li>
+                </ul>
+                <?php if (isset($_POST['import_additional_data']) && $_POST['import_additional_data'] === 'yes'): ?>
+                <p style="margin-top: 10px; color: #666;">
+                    <small>Additional test users: manager, accountant, underwriter, claims (all password: admin123)</small>
+                </p>
+                <?php endif; ?>
             </div>
 
             <div class="warning-box">
                 <strong>⚠️ IMPORTANT SECURITY NOTICE:</strong>
                 <p style="margin-top: 10px;">For security reasons, please DELETE or RENAME the <code>setup.php</code> file immediately!</p>
+                <p style="margin-top: 5px;">Installation log saved to: <code><?php echo basename($log_file); ?></code></p>
             </div>
 
             <div style="text-align: center;">
-                <a href="index.php" class="btn-link">Launch Application →</a>
+                <a href="dashboard" class="btn-link">Go to Dashboard →</a>
+                <p style="margin-top: 15px; color: #666;">
+                    <small>You will be redirected to the login page if not logged in</small>
+                </p>
             </div>
+
+            <script>
+                // Auto redirect after 5 seconds
+                setTimeout(function() {
+                    window.location.href = 'dashboard';
+                }, 5000);
+            </script>
 
         <?php elseif (!empty($errors)): ?>
             <!-- Error Screen -->
@@ -394,13 +569,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <?php else: ?>
             <!-- Setup Form -->
             <h1>Database Setup</h1>
-            <p class="subtitle">Insurance Management System v2.0</p>
+            <p class="subtitle">NA-FIX ERP System - Complete Installation</p>
+
+            <!-- System Requirements Check -->
+            <div class="info-box" style="margin-bottom: 25px;">
+                <h3>🔍 System Requirements Check</h3>
+                <table style="width: 100%; margin-top: 15px; border-collapse: collapse;">
+                    <?php
+                    $all_passed = true;
+                    foreach ($system_checks as $key => $check):
+                        if (!$check['status'] && $check['required'] !== 'Optional') {
+                            $all_passed = false;
+                        }
+                    ?>
+                    <tr style="border-bottom: 1px solid #eee;">
+                        <td style="padding: 10px 5px;">
+                            <?php if ($check['status']): ?>
+                                <span style="color: #28a745; font-size: 18px;">✓</span>
+                            <?php else: ?>
+                                <span style="color: #dc3545; font-size: 18px;">✗</span>
+                            <?php endif; ?>
+                            <?php echo $check['name']; ?>
+                        </td>
+                        <td style="padding: 10px 5px; text-align: right; color: #666;">
+                            <?php echo $check['current']; ?>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </table>
+
+                <?php if (!$all_passed): ?>
+                <div class="alert alert-error" style="margin-top: 15px;">
+                    <strong>⚠️ Warning:</strong> Some required checks failed. Please fix the issues above before proceeding.
+                </div>
+                <?php endif; ?>
+            </div>
 
             <div class="alert alert-info">
                 <strong>ℹ️ Setup Instructions:</strong><br>
-                1. Enter your database credentials below<br>
-                2. Choose whether to import sample data<br>
-                3. Click "Install Database" button
+                1. Ensure all system requirements are met (green checkmarks above)<br>
+                2. Enter your MySQL database credentials below<br>
+                3. Choose whether to import additional data (recommended)<br>
+                4. Click "Install Database" button
             </div>
 
             <form method="POST">
@@ -426,27 +636,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 <div class="form-group">
                     <div class="checkbox-group">
-                        <input type="checkbox" name="import_sample_data" value="yes" id="sample_data" checked>
-                        <label for="sample_data" style="margin: 0;">Import Sample Data (Recommended for testing)</label>
+                        <input type="checkbox" name="import_additional_data" value="yes" id="additional_data" checked>
+                        <label for="additional_data" style="margin: 0;">Import Additional Data (Recommended)</label>
                     </div>
                     <small style="color: #666; margin-left: 30px; display: block; margin-top: 5px;">
-                        Includes demo customers, products, invoices, and transactions
+                        Includes: Extra test users (manager, accountant, underwriter, claims), extended chart of accounts, comprehensive role permissions, opening balances, categories, units, departments, and more
                     </small>
                 </div>
 
-                <button type="submit">🚀 Install Database</button>
+                <button type="submit" <?php echo !$all_passed ? 'disabled' : ''; ?>>🚀 Install Database</button>
             </form>
 
             <div class="info-box" style="margin-top: 30px;">
                 <h3>📦 What will be installed:</h3>
                 <ul>
-                    <li>• 23 Database Tables</li>
-                    <li>• Complete Chart of Accounts</li>
+                    <li>• <strong>100+ Database Tables</strong> (Complete ERP System)</li>
+                    <li>• <strong>Double-Entry Accounting System</strong></li>
+                    <li>• Complete Chart of Accounts (Assets, Liabilities, Equity, Income, Expenses)</li>
+                    <li>• Insurance Management (Policies, Claims, Commissions, Brokers, Agents)</li>
                     <li>• Customer & Supplier Management</li>
-                    <li>• Product Catalog System</li>
+                    <li>• Product Catalog & Inventory System</li>
                     <li>• Sales & Purchase Modules</li>
-                    <li>• Broker & Agent Commission Tracking</li>
-                    <li>• Financial Reports & Accounting</li>
+                    <li>• Receipt & Payment Processing</li>
+                    <li>• Multi-Currency Support (10 currencies)</li>
+                    <li>• VAT/Tax Management (UAE 5% VAT)</li>
+                    <li>• Banking & Finance Modules</li>
+                    <li>• User Authentication & Role-Based Access Control</li>
+                    <li>• Audit Logs & Security Features</li>
+                    <li>• Financial Reports & Analytics</li>
+                </ul>
+            </div>
+
+            <div class="info-box" style="margin-top: 20px;">
+                <h3>📋 Files to be imported:</h3>
+                <ul>
+                    <li>• <strong>fullscheme.sql</strong> - Complete database structure with 100+ tables and sample data</li>
+                    <li>• <strong>additional_data.sql</strong> - Extra test users, accounts, and permissions (optional)</li>
                 </ul>
             </div>
         <?php endif; ?>
