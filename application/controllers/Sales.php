@@ -8,10 +8,6 @@ class Sales extends CI_Controller {
         $this->load->model('Invoice_model');
         $this->load->model('Customer_model');
         $this->load->model('Product_model');
-
-        if (!$this->session->userdata('user_id')) {
-            redirect('login');
-        }
     }
 
     /**
@@ -116,7 +112,7 @@ class Sales extends CI_Controller {
                     'vat' => $vat,
                     'grand_total' => $grand_total,
                     'payment_status' => 'unpaid',
-                    'sales_by' => $this->session->userdata('user_id'),
+                    'sales_by' => $this->session->userdata('user_id') ?? 1,
                     'sales_date' => date('Y-m-d H:i:s')
                 ];
 
