@@ -88,6 +88,7 @@ class Invoice_model extends MY_Model {
 
     /**
      * Create invoice with items and accounting entries
+     * Enhanced with stock deduction
      */
     public function create_invoice($invoice_data, $items) {
         $this->db->trans_start();
@@ -96,10 +97,31 @@ class Invoice_model extends MY_Model {
         $this->db->insert($this->table, $invoice_data);
         $invoice_id = $this->db->insert_id();
 
-        // Insert items
+        // Insert items and update stock
         foreach ($items as $item) {
             $item['invoice_id'] = $invoice_id;
             $this->db->insert('invoice_item', $item);
+
+            // Deduct stock for this item
+            $this->update_product_stock(
+                $item['product_id'],
+                $item['quantity'],
+                'subtract',
+                $invoice_data['date'],
+                $invoice_id
+            );
+
+            // Update stock ledger (itemsstk table)
+            $this->update_stock_ledger([
+                'product_id' => $item['product_id'],
+                'transaction_date' => $invoice_data['date'],
+                'document_no' => $invoice_data['invoice'],
+                'transaction_type' => 'sales',
+                'quantity_in' => 0,
+                'quantity_out' => $item['quantity'],
+                'rate' => $item['rate'],
+                'reference_id' => $invoice_id
+            ]);
         }
 
         // Post to daybook (double-entry)
@@ -144,6 +166,73 @@ class Invoice_model extends MY_Model {
         $this->db->trans_complete();
 
         return $this->db->trans_status() ? $invoice_id : false;
+    }
+
+    /**
+     * Update product stock quantity (deduct on sale)
+     *
+     * @param int $product_id Product ID
+     * @param float $quantity Quantity to add/subtract
+     * @param string $operation 'add' or 'subtract'
+     * @param string $date Transaction date
+     * @param int $reference_id Reference transaction ID
+     * @return bool
+     */
+    public function update_product_stock($product_id, $quantity, $operation = 'subtract', $date = null, $reference_id = null) {
+        // Get current product details
+        $this->db->select('quantity, price');
+        $this->db->where('product_id', $product_id);
+        $product = $this->db->get('product_information')->row();
+
+        if (!$product) {
+            return false;
+        }
+
+        // Calculate new quantity
+        if ($operation == 'add') {
+            $new_quantity = $product->quantity + $quantity;
+        } else {
+            $new_quantity = $product->quantity - $quantity;
+        }
+
+        // Prevent negative stock
+        if ($new_quantity < 0) {
+            $new_quantity = 0;
+        }
+
+        // Update product quantity
+        $this->db->where('product_id', $product_id);
+        $this->db->update('product_information', [
+            'quantity' => $new_quantity
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Update stock ledger (itemsstk table)
+     *
+     * @param array $ledger_data Stock ledger data
+     * @return int|false Entry ID or false
+     */
+    public function update_stock_ledger($ledger_data) {
+        // Check if itemsstk table exists
+        if (!$this->db->table_exists('itemsstk')) {
+            return false;
+        }
+
+        $entry = [
+            'code' => $ledger_data['product_id'],
+            'tdate' => $ledger_data['transaction_date'],
+            'docno' => $ledger_data['document_no'],
+            'ttype' => $ledger_data['transaction_type'],
+            'qtyin' => $ledger_data['quantity_in'],
+            'qtyout' => $ledger_data['quantity_out'],
+            'rate' => $ledger_data['rate']
+        ];
+
+        $this->db->insert('itemsstk', $entry);
+        return $this->db->insert_id();
     }
 
     /**

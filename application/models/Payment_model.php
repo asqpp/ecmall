@@ -53,6 +53,7 @@ class Payment_model extends MY_Model {
 
     /**
      * Create payment with accounting entries
+     * Enhanced with PDC handling
      */
     public function create_payment($payment_data) {
         $this->db->trans_start();
@@ -62,36 +63,112 @@ class Payment_model extends MY_Model {
         $payment_id = $this->db->insert_id();
 
         // Get purchase details for supplier_id
-        $this->db->select('supplier_id');
+        $this->db->select('supplier_id, chalan_no');
         $this->db->where('purchase_id', $payment_data['purchase_id']);
         $purchase = $this->db->get('product_purchase')->row();
 
         if ($purchase) {
-            // Post to daybook (double-entry)
+            // Load required models
             $this->load->model('Daybook_model');
 
-            // Dr: Supplier Account (reduces liability)
-            $this->Daybook_model->post_entry([
-                'date' => $payment_data['payment_date'],
-                'account_code' => 'SUPP_' . $purchase->supplier_id,
-                'description' => 'Payment - ' . ($payment_data['details'] ?? 'Supplier Payment'),
-                'debit' => $payment_data['amount'],
-                'credit' => 0,
-                'reference_type' => 'payment',
-                'reference_id' => $payment_id
-            ]);
+            // Determine if this is a post-dated cheque
+            $is_pdc = ($payment_data['payment_method'] == 'cheque' && !empty($payment_data['cheque_date']) && $payment_data['cheque_date'] > date('Y-m-d'));
 
-            // Cr: Cash/Bank (based on payment method)
-            $account_code = ($payment_data['payment_method'] == 'cash') ? 'CASH' : 'BANK';
-            $this->Daybook_model->post_entry([
-                'date' => $payment_data['payment_date'],
-                'account_code' => $account_code,
-                'description' => 'Payment - ' . ($payment_data['details'] ?? 'Supplier Payment'),
-                'debit' => 0,
-                'credit' => $payment_data['amount'],
-                'reference_type' => 'payment',
-                'reference_id' => $payment_id
-            ]);
+            if ($is_pdc) {
+                // Post-Dated Cheque - Different accounting treatment
+                $this->load->model('PDC_model');
+
+                // Create PDC entry
+                $pdc_id = $this->PDC_model->create_pdc([
+                    'transaction_date' => $payment_data['payment_date'],
+                    'document_no' => $payment_data['payment_voucher_no'] ?? 'PAY-' . $payment_id,
+                    'bank' => $payment_data['bank'] ?? '',
+                    'party_code' => $purchase->supplier_id,
+                    'cheque_no' => $payment_data['cheque_no'] ?? '',
+                    'cheque_date' => $payment_data['cheque_date'],
+                    'amount' => $payment_data['amount'],
+                    'particulars' => 'Payment for Purchase #' . $purchase->chalan_no,
+                    'type' => 'P', // Payment
+                    'control' => date('Y-m-d H:i:s')
+                ]);
+
+                // Dr: Supplier Account (reduces payable immediately)
+                $this->Daybook_model->post_entry([
+                    'date' => $payment_data['payment_date'],
+                    'account_code' => 'SUPP_' . $purchase->supplier_id,
+                    'description' => 'PDC Issued - Cheque #' . ($payment_data['cheque_no'] ?? '') . ' - Purchase #' . $purchase->chalan_no,
+                    'debit' => $payment_data['amount'],
+                    'credit' => 0,
+                    'reference_type' => 'pdc',
+                    'reference_id' => $pdc_id
+                ]);
+
+                // Cr: PDC Payable (Liability - will convert to bank deduction when cleared)
+                $this->Daybook_model->post_entry([
+                    'date' => $payment_data['payment_date'],
+                    'account_code' => 'PDCPAY',
+                    'description' => 'PDC Issued - Cheque #' . ($payment_data['cheque_no'] ?? '') . ' - Purchase #' . $purchase->chalan_no,
+                    'debit' => 0,
+                    'credit' => $payment_data['amount'],
+                    'reference_type' => 'pdc',
+                    'reference_id' => $pdc_id
+                ]);
+
+            } else {
+                // Regular payment (Cash/Bank/Cleared Cheque)
+
+                // Dr: Supplier Account (reduces payable)
+                $this->Daybook_model->post_entry([
+                    'date' => $payment_data['payment_date'],
+                    'account_code' => 'SUPP_' . $purchase->supplier_id,
+                    'description' => 'Payment - ' . ($payment_data['details'] ?? 'Supplier Payment'),
+                    'debit' => $payment_data['amount'],
+                    'credit' => 0,
+                    'reference_type' => 'payment',
+                    'reference_id' => $payment_id
+                ]);
+
+                // Cr: Cash/Bank (reduces asset)
+                $account_code = ($payment_data['payment_method'] == 'cash') ? 'CASH' : 'BANK';
+                $this->Daybook_model->post_entry([
+                    'date' => $payment_data['payment_date'],
+                    'account_code' => $account_code,
+                    'description' => 'Payment - ' . ($payment_data['details'] ?? 'Supplier Payment'),
+                    'debit' => 0,
+                    'credit' => $payment_data['amount'],
+                    'reference_type' => 'payment',
+                    'reference_id' => $payment_id
+                ]);
+            }
+
+            // Handle discount received if provided
+            if (!empty($payment_data['discount']) && $payment_data['discount'] > 0) {
+                // Dr: Supplier Account (additional reduction)
+                $this->Daybook_model->post_entry([
+                    'date' => $payment_data['payment_date'],
+                    'account_code' => 'SUPP_' . $purchase->supplier_id,
+                    'description' => 'Discount received - Purchase #' . $purchase->chalan_no,
+                    'debit' => $payment_data['discount'],
+                    'credit' => 0,
+                    'reference_type' => 'payment',
+                    'reference_id' => $payment_id
+                ]);
+
+                // Cr: Discount Received (Income)
+                $this->Daybook_model->post_entry([
+                    'date' => $payment_data['payment_date'],
+                    'account_code' => 'DISCREC',
+                    'description' => 'Discount received - Purchase #' . $purchase->chalan_no,
+                    'debit' => 0,
+                    'credit' => $payment_data['discount'],
+                    'reference_type' => 'payment',
+                    'reference_id' => $payment_id
+                ]);
+            }
+
+            // Update purchase payment status
+            $this->load->model('Purchase_model');
+            $this->Purchase_model->update_payment_status($payment_data['purchase_id']);
         }
 
         $this->db->trans_complete();

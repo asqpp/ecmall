@@ -53,6 +53,7 @@ class Receipt_model extends MY_Model {
 
     /**
      * Create receipt with accounting entries
+     * Enhanced with PDC handling and collection tracking
      */
     public function create_receipt($receipt_data) {
         $this->db->trans_start();
@@ -62,40 +63,132 @@ class Receipt_model extends MY_Model {
         $receipt_id = $this->db->insert_id();
 
         // Get invoice details for customer_id
-        $this->db->select('customer_id, invoice');
+        $this->db->select('customer_id, invoice, grand_total');
         $this->db->where('invoice_id', $receipt_data['invoice_id']);
         $invoice = $this->db->get('invoice')->row();
 
         if ($invoice) {
-            // Post to daybook (double-entry)
+            // Load required models
             $this->load->model('Daybook_model');
+            $this->load->model('Collection_model');
 
-            // Dr: Cash/Bank (based on payment method)
-            $account_code = ($receipt_data['payment_method'] == 'cash') ? 'CASH' : 'BANK';
-            $this->Daybook_model->post_entry([
-                'date' => $receipt_data['receipt_date'],
-                'account_code' => $account_code,
-                'description' => 'Receipt from customer - Invoice #' . $invoice->invoice,
-                'debit' => $receipt_data['amount'],
-                'credit' => 0,
-                'reference_type' => 'receipt',
-                'reference_id' => $receipt_id
+            // Determine account code based on payment method
+            $is_pdc = ($receipt_data['payment_method'] == 'cheque' && !empty($receipt_data['cheque_date']) && $receipt_data['cheque_date'] > date('Y-m-d'));
+
+            if ($is_pdc) {
+                // Post-Dated Cheque - Different accounting treatment
+                $this->load->model('PDC_model');
+
+                // Create PDC entry
+                $pdc_id = $this->PDC_model->create_pdc([
+                    'transaction_date' => $receipt_data['receipt_date'],
+                    'document_no' => $receipt_data['receipt_voucher_no'] ?? 'RCP-' . $receipt_id,
+                    'bank' => $receipt_data['bank'] ?? '',
+                    'party_code' => $invoice->customer_id,
+                    'cheque_no' => $receipt_data['cheque_no'] ?? '',
+                    'cheque_date' => $receipt_data['cheque_date'],
+                    'amount' => $receipt_data['amount'],
+                    'particulars' => 'Receipt against Invoice #' . $invoice->invoice,
+                    'type' => 'R', // Receipt
+                    'control' => date('Y-m-d H:i:s')
+                ]);
+
+                // Dr: PDC Receivable (Asset - will convert to cash when cleared)
+                $this->Daybook_model->post_entry([
+                    'date' => $receipt_data['receipt_date'],
+                    'account_code' => 'PDCREC',
+                    'description' => 'PDC Received - Cheque #' . ($receipt_data['cheque_no'] ?? '') . ' - Invoice #' . $invoice->invoice,
+                    'debit' => $receipt_data['amount'],
+                    'credit' => 0,
+                    'reference_type' => 'pdc',
+                    'reference_id' => $pdc_id
+                ]);
+
+                // Cr: Customer Account (reduces receivable immediately)
+                $this->Daybook_model->post_entry([
+                    'date' => $receipt_data['receipt_date'],
+                    'account_code' => 'CUST_' . $invoice->customer_id,
+                    'description' => 'PDC Received - Cheque #' . ($receipt_data['cheque_no'] ?? '') . ' - Invoice #' . $invoice->invoice,
+                    'debit' => 0,
+                    'credit' => $receipt_data['amount'],
+                    'reference_type' => 'pdc',
+                    'reference_id' => $pdc_id
+                ]);
+
+            } else {
+                // Regular receipt (Cash/Bank/Cleared Cheque)
+                $account_code = ($receipt_data['payment_method'] == 'cash') ? 'CASH' : 'BANK';
+
+                // Dr: Cash/Bank
+                $this->Daybook_model->post_entry([
+                    'date' => $receipt_data['receipt_date'],
+                    'account_code' => $account_code,
+                    'description' => 'Receipt from customer - Invoice #' . $invoice->invoice,
+                    'debit' => $receipt_data['amount'],
+                    'credit' => 0,
+                    'reference_type' => 'receipt',
+                    'reference_id' => $receipt_id
+                ]);
+
+                // Cr: Customer Account (reduces receivable)
+                $this->Daybook_model->post_entry([
+                    'date' => $receipt_data['receipt_date'],
+                    'account_code' => 'CUST_' . $invoice->customer_id,
+                    'description' => 'Receipt from customer - Invoice #' . $invoice->invoice,
+                    'debit' => 0,
+                    'credit' => $receipt_data['amount'],
+                    'reference_type' => 'receipt',
+                    'reference_id' => $receipt_id
+                ]);
+            }
+
+            // Create collection entry (legacy system tracking)
+            $this->Collection_model->create_collection([
+                'customer_id' => $invoice->customer_id,
+                'transaction_date' => $receipt_data['receipt_date'],
+                'invoice_id' => $receipt_data['invoice_id'],
+                'amount' => $receipt_data['amount'],
+                'discount' => $receipt_data['discount'] ?? 0,
+                'due_date' => $receipt_data['due_date'] ?? null,
+                'receipt_id' => $receipt_id,
+                'rate' => $receipt_data['rate'] ?? 0,
+                'rate2' => $receipt_data['rate2'] ?? 0
             ]);
 
-            // Cr: Customer Account (reduces receivable)
-            $this->Daybook_model->post_entry([
-                'date' => $receipt_data['receipt_date'],
-                'account_code' => 'CUST_' . $invoice->customer_id,
-                'description' => 'Receipt from customer - Invoice #' . $invoice->invoice,
-                'debit' => 0,
-                'credit' => $receipt_data['amount'],
-                'reference_type' => 'receipt',
-                'reference_id' => $receipt_id
-            ]);
+            // Handle discount if provided
+            if (!empty($receipt_data['discount']) && $receipt_data['discount'] > 0) {
+                // Dr: Discount Allowed (Expense)
+                $this->Daybook_model->post_entry([
+                    'date' => $receipt_data['receipt_date'],
+                    'account_code' => 'DISCALL',
+                    'description' => 'Discount allowed - Invoice #' . $invoice->invoice,
+                    'debit' => $receipt_data['discount'],
+                    'credit' => 0,
+                    'reference_type' => 'receipt',
+                    'reference_id' => $receipt_id
+                ]);
+
+                // Cr: Customer Account
+                $this->Daybook_model->post_entry([
+                    'date' => $receipt_data['receipt_date'],
+                    'account_code' => 'CUST_' . $invoice->customer_id,
+                    'description' => 'Discount allowed - Invoice #' . $invoice->invoice,
+                    'debit' => 0,
+                    'credit' => $receipt_data['discount'],
+                    'reference_type' => 'receipt',
+                    'reference_id' => $receipt_id
+                ]);
+            }
 
             // Update invoice payment status
             $this->load->model('Invoice_model');
             $this->Invoice_model->update_payment_status($receipt_data['invoice_id']);
+
+            // Update customer due date if provided
+            if (!empty($receipt_data['due_date'])) {
+                $this->db->where('customer_id', $invoice->customer_id);
+                $this->db->update('customer_information', ['duedate' => $receipt_data['due_date']]);
+            }
         }
 
         $this->db->trans_complete();

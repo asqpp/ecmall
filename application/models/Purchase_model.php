@@ -84,6 +84,7 @@ class Purchase_model extends MY_Model {
 
     /**
      * Create purchase with items and accounting entries
+     * Enhanced with stock tracking
      */
     public function create_purchase($purchase_data, $items) {
         $this->db->trans_start();
@@ -92,10 +93,49 @@ class Purchase_model extends MY_Model {
         $this->db->insert($this->table, $purchase_data);
         $purchase_id = $this->db->insert_id();
 
-        // Insert items
+        // Insert items and update stock
         foreach ($items as $item) {
             $item['purchase_id'] = $purchase_id;
             $this->db->insert('purchase_item', $item);
+            $item_id = $this->db->insert_id();
+
+            // Update product stock (increase inventory)
+            $this->update_product_stock(
+                $item['product_id'],
+                $item['quantity'],
+                'add',
+                $purchase_data['purchase_date'],
+                $purchase_id
+            );
+
+            // Create batch tracking if batch info provided
+            if (!empty($item['batch'])) {
+                $this->create_batch_entry([
+                    'product_id' => $item['product_id'],
+                    'batch' => $item['batch'],
+                    'weight' => $item['weight'] ?? 0,
+                    'touch' => $item['touch'] ?? 0,
+                    'less_weight' => $item['less_weight'] ?? 0,
+                    'amount' => $item['total_price'],
+                    'issued_weight' => 0,
+                    'pending' => 1,
+                    'transaction_date' => $purchase_data['purchase_date'],
+                    'document_no' => $purchase_data['chalan_no'],
+                    'purchase_item_id' => $item_id
+                ]);
+            }
+
+            // Update stock ledger (itemsstk table)
+            $this->update_stock_ledger([
+                'product_id' => $item['product_id'],
+                'transaction_date' => $purchase_data['purchase_date'],
+                'document_no' => $purchase_data['chalan_no'],
+                'transaction_type' => 'purchase',
+                'quantity_in' => $item['quantity'],
+                'quantity_out' => 0,
+                'rate' => $item['rate'],
+                'reference_id' => $purchase_id
+            ]);
         }
 
         // Post to daybook (double-entry)
@@ -140,6 +180,132 @@ class Purchase_model extends MY_Model {
         $this->db->trans_complete();
 
         return $this->db->trans_status() ? $purchase_id : false;
+    }
+
+    /**
+     * Update product stock quantity
+     *
+     * @param int $product_id Product ID
+     * @param float $quantity Quantity to add/subtract
+     * @param string $operation 'add' or 'subtract'
+     * @param string $date Transaction date
+     * @param int $reference_id Reference transaction ID
+     * @return bool
+     */
+    public function update_product_stock($product_id, $quantity, $operation = 'add', $date = null, $reference_id = null) {
+        // Get current product details
+        $this->db->select('quantity, price');
+        $this->db->where('product_id', $product_id);
+        $product = $this->db->get('product_information')->row();
+
+        if (!$product) {
+            return false;
+        }
+
+        // Calculate new quantity
+        if ($operation == 'add') {
+            $new_quantity = $product->quantity + $quantity;
+        } else {
+            $new_quantity = $product->quantity - $quantity;
+        }
+
+        // Update product quantity
+        $this->db->where('product_id', $product_id);
+        $this->db->update('product_information', [
+            'quantity' => $new_quantity
+        ]);
+
+        return true;
+    }
+
+    /**
+     * Create batch tracking entry (for items with batch/lot numbers)
+     *
+     * @param array $batch_data Batch data
+     * @return int|false Batch ID or false
+     */
+    public function create_batch_entry($batch_data) {
+        // Check if oglist table exists
+        if (!$this->db->table_exists('oglist')) {
+            return false;
+        }
+
+        $entry = [
+            'code' => $batch_data['product_id'],
+            'batch' => $batch_data['batch'],
+            'weight' => $batch_data['weight'],
+            'touch' => $batch_data['touch'],
+            'lesswgt' => $batch_data['less_weight'],
+            'amount' => $batch_data['amount'],
+            'issuedwgt' => $batch_data['issued_weight'],
+            'pend' => $batch_data['pending'],
+            'tdate' => $batch_data['transaction_date'],
+            'docno' => $batch_data['document_no']
+        ];
+
+        $this->db->insert('oglist', $entry);
+        return $this->db->insert_id();
+    }
+
+    /**
+     * Update stock ledger (itemsstk table)
+     *
+     * @param array $ledger_data Stock ledger data
+     * @return int|false Entry ID or false
+     */
+    public function update_stock_ledger($ledger_data) {
+        // Check if itemsstk table exists
+        if (!$this->db->table_exists('itemsstk')) {
+            return false;
+        }
+
+        $entry = [
+            'code' => $ledger_data['product_id'],
+            'tdate' => $ledger_data['transaction_date'],
+            'docno' => $ledger_data['document_no'],
+            'ttype' => $ledger_data['transaction_type'],
+            'qtyin' => $ledger_data['quantity_in'],
+            'qtyout' => $ledger_data['quantity_out'],
+            'rate' => $ledger_data['rate']
+        ];
+
+        $this->db->insert('itemsstk', $entry);
+        return $this->db->insert_id();
+    }
+
+    /**
+     * Update payment status based on payments received
+     */
+    public function update_payment_status($purchase_id) {
+        // Get purchase total
+        $this->db->select('grand_total_amount');
+        $this->db->where('purchase_id', $purchase_id);
+        $purchase = $this->db->get($this->table)->row();
+
+        if (!$purchase) {
+            return false;
+        }
+
+        // Get total payments
+        $this->db->select('SUM(amount) as total_paid');
+        $this->db->where('purchase_id', $purchase_id);
+        $payment_result = $this->db->get('payment')->row();
+        $total_paid = $payment_result->total_paid ?? 0;
+
+        // Determine payment status
+        if ($total_paid >= $purchase->grand_total_amount) {
+            $payment_status = 'paid';
+        } elseif ($total_paid > 0) {
+            $payment_status = 'partial';
+        } else {
+            $payment_status = 'unpaid';
+        }
+
+        // Update purchase
+        $this->db->where('purchase_id', $purchase_id);
+        $this->db->update($this->table, ['payment_status' => $payment_status]);
+
+        return true;
     }
 
     /**
